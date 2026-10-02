@@ -4,12 +4,12 @@ A read-only allowlist wrapper around `gcloud`. Use it in an agent's command allo
 
 ## Install
 
-Download [`bin/gcloud-ro`](https://github.com/daniellockyer/gcloud-ro/blob/main/bin/gcloud-ro) from GitHub (the repo is private, so this uses `gh` for auth):
+Download [`bin/gcloud-ro`](https://raw.githubusercontent.com/daniellockyer/gcloud-ro/main/bin/gcloud-ro) from GitHub:
 
 ```bash
 mkdir -p ~/.local/bin
-gh api repos/daniellockyer/gcloud-ro/contents/bin/gcloud-ro \
-  -H "Accept: application/vnd.github.raw" > ~/.local/bin/gcloud-ro
+curl -fsSL https://raw.githubusercontent.com/daniellockyer/gcloud-ro/main/bin/gcloud-ro \
+  -o ~/.local/bin/gcloud-ro
 chmod +x ~/.local/bin/gcloud-ro
 ```
 
