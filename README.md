@@ -2,6 +2,9 @@
 
 A read-only allowlist wrapper around `gcloud`. Use it in an agent's command allowlist instead of `gcloud` so only read-only commands (`list`, `describe`, `get`, `read`, etc.) can run. Unknown verbs are denied.
 
+> [!WARNING]
+> `gcloud-ro` is a client-side filter, not a security boundary. An agent that can run `gcloud`, `curl`, or a client library directly bypasses it. Always pair it with read-only credentials, such as a dedicated service account with narrow viewer roles. See [Recommended setup](#recommended-setup).
+
 ## Install
 
 Download [`bin/gcloud-ro`](https://raw.githubusercontent.com/daniellockyer/gcloud-ro/main/bin/gcloud-ro) from GitHub:
@@ -33,7 +36,7 @@ bin/gcloud-ro --self-test      # run built-in tests
 
 ## Recommended setup
 
-`gcloud-ro` is a client-side filter, not a security boundary. An agent that can run `gcloud`, `curl`, or a client library directly bypasses it. Pair it with credentials that can only read:
+Pair `gcloud-ro` with credentials that can only read:
 
 1. Create a dedicated service account with narrow read roles (for example `roles/compute.viewer`, `roles/logging.viewer`). Avoid roles that read sensitive data, such as Secret Manager access or Cloud Storage object reads, unless needed.
 
