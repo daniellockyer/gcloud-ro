@@ -2,6 +2,16 @@
 
 A read-only allowlist wrapper around `gcloud`. Use it in an agent's command allowlist instead of `gcloud` so only read-only commands (`list`, `describe`, `get`, `read`, etc.) can run. Unknown verbs are denied.
 
+## Install
+
+```bash
+mkdir -p ~/.local/bin
+cp bin/gcloud-ro ~/.local/bin/
+chmod +x ~/.local/bin/gcloud-ro
+```
+
+Make sure `~/.local/bin` is on your `PATH`.
+
 ## Usage
 
 ```bash
