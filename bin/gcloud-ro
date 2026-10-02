@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+# gcloud-ro — allowlist wrapper that runs only read-only gcloud commands.
+#
+# Use this binary in an agent command allowlist instead of `gcloud`.
+# The wrapper fails closed: unknown verbs are denied.
+#
+# Limitation: a resource named exactly like a write verb (for example
+# `gcloud compute instances describe create`) is denied.
+# Prefer `--flag=value` over `--flag value`.
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+gcloud-ro — read-only wrapper for gcloud
+
+Usage:
+  gcloud-ro [gcloud arguments...]
+  gcloud-ro --self-test
+  gcloud-ro --print-policy
+  gcloud-ro --help
+
+Allowed command verbs include list, ls, describe, get, read, cat, and help.
+Write verbs, SSH, auth-token print, secret access, and impersonation are denied.
+
+Environment:
+  GCLOUD_RO_BIN       Real gcloud binary (default: first gcloud on PATH)
+  GCLOUD_RO_DRY_RUN   If set to 1, print the approved command and exit 0
+EOF
+}
+
+# Top-level groups that share a name with a verb. Only the first command
+# token (after alpha/beta) may use this exemption.
+TOP_LEVEL_GROUPS='
+access-approval access-context-manager active-directory ai ai-platform
+alloydb alpha anthos api-gateway apigee app artifacts asset assured auth
+backup-dr batch beta bigtable billing blockchain-node-engine bms
+certificate-manager cloud-shell cloudlocationfinder colab composer compute
+config container data-catalog dataflow dataform dataplex dataproc datastore
+datastream deploy deployment-manager developer-connect dns edge-cache
+edge-cloud emulators endpoints essential-contacts eventarc filestore
+firebase firestore functions gemini healthcare iam iap identity ids
+immersive-stream infra-manager kms logging looker lustre memcache
+memorystore metastore ml model-armor monitoring netapp network-connectivity
+network-management network-security network-services notebooks
+oracle-database org-policies organizations pam param policy-intelligence
+policy-troubleshooter privateca publicca pubsub recaptcha recommender redis
+resource-manager resource-settings run secrets service-directory services
+source spanner sql storage tasks telcoautomation topic transcoder transfer
+vmware workbench workflows workspace-add-ons workstations
+'
+
+ALLOWED_VERBS='
+cat check count describe diff du explain get get-ancestors
+get-ancestors-iam-policy get-effective-firewalls get-guest-attributes
+get-iam-info get-iam-policy get-named-ports get-screenshot
+get-serial-port-output hash help info list list-commands list-usable
+lookup ls preview read search show status topic validate version wait
+watch tail
+'
+
+# Exact verbs plus hyphen suffixes (create matches create-disk).
+DENIED_VERBS='
+access activate add allocate append apply attach backup bind browse
+build call cancel clone commit compose configure connect copy cp create
+debug decrypt delete deploy destroy detach disable download edit enable
+encrypt exec execute export failover get-credentials grant import init
+insert install invoke login migrate modify move mv patch print-access-token
+print-identity-token print-refresh-token promote proxy pull purge push put
+release remove rename replace reserve reset resize restart restore revoke
+rewrite rollback rm rsync run scp set sign-blob sign-jwt ssh start stop
+submit truncate undelete unbind uninstall unset update upload write
+'
+
+BLOCKED_FLAGS='
+--access-token-file
+--command
+--container
+--flags-file
+--impersonate-service-account
+--ssh-flag
+--ssh-key-file
+--ssh-key-expire-after
+'
+
+BOOLEAN_FLAGS='
+--help -h --version --quiet -q --log-http --uri
+--user-output-enabled --no-user-output-enabled
+--no-quiet --simple-list --no-pager
+'
+
+VALUE_FLAGS='
+--account --billing-project --configuration --flatten --format --project
+--trace-token --verbosity --filter --limit --page-size --sort-by
+--zone --region --location --locations --cluster --namespace --bucket
+--prefix --age --freshness --billing-project --impersonate-service-account
+--access-token-file --flags-file --configuration --property
+--page-token --start-time --end-time --freshness --snapshot
+--network --subnet --resource --resource-zone --uri --path
+--log-filter --order --freshness --view --billing-project
+--service --platform --tag --revision --job --dataset --table
+--database --instance --repository --package --kms-key
+--keyring --key --policy-name --organization --folder
+'
+
+is_word_in() {
+  local needle="$1"
+  local haystack="$2"
+  local normalized
+  normalized="$(printf '%s' "$haystack" | tr '[:space:]' ' ')"
+  [[ " $normalized " == *" $needle "* ]]
+}
+
+is_denied_verb() {
+  local token="$1"
+  local verb
+  if is_word_in "$token" "$DENIED_VERBS"; then
+    return 0
+  fi
+  for verb in $DENIED_VERBS; do
+    if [[ "$token" == "$verb"-* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_allowed_verb() {
+  local token="$1"
+  local verb
+  if is_denied_verb "$token"; then
+    return 1
+  fi
+  if is_word_in "$token" "$ALLOWED_VERBS"; then
+    return 0
+  fi
+  for verb in $ALLOWED_VERBS; do
+    if [[ "$token" == "$verb"-* ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+flag_name() {
+  local raw="$1"
+  if [[ "$raw" == --*=* ]]; then
+    printf '%s' "${raw%%=*}"
+    return
+  fi
+  printf '%s' "$raw"
+}
+
+is_blocked_flag() {
+  is_word_in "$(flag_name "$1")" "$BLOCKED_FLAGS"
+}
+
+is_boolean_flag() {
+  is_word_in "$1" "$BOOLEAN_FLAGS"
+}
+
+is_value_flag() {
+  is_word_in "$(flag_name "$1")" "$VALUE_FLAGS"
+}
+
+deny() {
+  local reason="$1"
+  printf 'gcloud-ro: denied: %s\n' "$reason" >&2
+  return 2
+}
+
+# Prints nothing and returns 0 when argv is an allowed gcloud invocation.
+# Returns 2 when denied. The caller must still exec gcloud.
+approve_args() {
+  local -a args=("$@")
+  local -a positionals=()
+  local i=0
+  local arg next name
+
+  if ((${#args[@]} == 0)); then
+    return 0
+  fi
+
+  # Help and version do not change cloud resources.
+  local help_or_version=0
+  for arg in "${args[@]}"; do
+    if is_word_in "$(flag_name "$arg")" "--help -h --version"; then
+      help_or_version=1
+    fi
+  done
+
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    arg="${args[$i]}"
+    name="$(flag_name "$arg")"
+
+    if [[ "$arg" == --* || ( "$arg" == -* && "$arg" != "-" ) ]]; then
+      if is_blocked_flag "$arg"; then
+        deny "flag ${name} is not allowed"
+        return 2
+      fi
+      if [[ "$arg" == --*=* ]]; then
+        continue
+      fi
+      if is_boolean_flag "$arg"; then
+        continue
+      fi
+      if is_value_flag "$arg"; then
+        next="${args[$((i + 1))]:-}"
+        if [[ -z "$next" || "$next" == -* ]]; then
+          deny "flag ${name} requires a value"
+          return 2
+        fi
+        i=$((i + 1))
+        continue
+      fi
+      # Unknown flag: do not consume the next token. A write verb that
+      # follows stays visible to the positional check.
+      continue
+    fi
+
+    positionals+=("$arg")
+  done
+
+  if ((help_or_version == 1)); then
+    return 0
+  fi
+
+  if ((${#positionals[@]} == 0)); then
+    return 0
+  fi
+
+  local start=0
+  if [[ "${positionals[0]}" == "alpha" || "${positionals[0]}" == "beta" ]]; then
+    start=1
+    if ((${#positionals[@]} == 1)); then
+      deny "alpha/beta requires a command"
+      return 2
+    fi
+  fi
+
+  local idx token found_allowed=0
+  for ((idx = start; idx < ${#positionals[@]}; idx++)); do
+    token="${positionals[$idx]}"
+    if is_denied_verb "$token"; then
+      if ((idx == start)) && is_word_in "$token" "$TOP_LEVEL_GROUPS"; then
+        continue
+      fi
+      deny "command '${token}' is not read-only"
+      return 2
+    fi
+    if is_allowed_verb "$token"; then
+      found_allowed=1
+    fi
+  done
+
+  if ((found_allowed == 0)); then
+    deny "no read-only command verb found"
+    return 2
+  fi
+
+  return 0
+}
+
+print_policy() {
+  cat <<EOF
+Allowed verbs:
+${ALLOWED_VERBS}
+
+Denied verbs (exact match or VERB-*):
+${DENIED_VERBS}
+
+Blocked flags:
+${BLOCKED_FLAGS}
+
+Blocked environment:
+  CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT
+  CLOUDSDK_AUTH_ACCESS_TOKEN_FILE
+EOF
+}
+
+assert_deny() {
+  local name="$1"
+  shift
+  if approve_args "$@" 2>/dev/null; then
+    printf 'FAIL %s: expected deny\n' "$name" >&2
+    return 1
+  fi
+  printf 'PASS deny  %s\n' "$name"
+}
+
+assert_allow() {
+  local name="$1"
+  shift
+  if ! approve_args "$@" 2>/dev/null; then
+    printf 'FAIL %s: expected allow\n' "$name" >&2
+    approve_args "$@" || true
+    return 1
+  fi
+  printf 'PASS allow %s\n' "$name"
+}
+
+self_test() {
+  local failed=0
+  assert_allow 'bare help' --help || failed=1
+  assert_allow 'group help' compute --help || failed=1
+  assert_allow 'create help' compute instances create --help || failed=1
+  assert_deny 'unknown verb' compute instances frobnicate || failed=1
+  assert_allow 'list' compute instances list || failed=1
+  assert_allow 'describe' compute instances describe my-vm --zone=us-central1-a || failed=1
+  assert_allow 'cloud run list' run services list --region=us-central1 || failed=1
+  assert_allow 'deploy group list' deploy releases list || failed=1
+  assert_allow 'config list' config list || failed=1
+  assert_allow 'storage cat' storage cat gs://bucket/obj || failed=1
+  assert_allow 'logging read' logging read 'severity>=ERROR' --limit=10 || failed=1
+  assert_allow 'projects describe' projects describe my-proj || failed=1
+  assert_allow 'alpha list' alpha compute instances list || failed=1
+  assert_allow 'get-iam-policy' projects get-iam-policy my-proj || failed=1
+  assert_allow 'filter equals' compute instances list --filter='name:create' || failed=1
+
+  assert_deny 'create' compute instances create box || failed=1
+  assert_deny 'create hidden by name list' compute instances create --name list || failed=1
+  assert_deny 'run deploy' run deploy mysvc || failed=1
+  assert_deny 'app deploy' app deploy || failed=1
+  assert_deny 'scheduler run' scheduler jobs run my-job || failed=1
+  assert_deny 'config set' config set project foo || failed=1
+  assert_deny 'storage cp' storage cp gs://a gs://b || failed=1
+  assert_deny 'secret access' secrets versions access latest --secret=foo || failed=1
+  assert_deny 'print token' auth print-access-token || failed=1
+  assert_deny 'get-credentials' container clusters get-credentials my-cluster || failed=1
+  assert_deny 'kms decrypt' kms decrypt --ciphertext-file=x --plaintext-file=y || failed=1
+  assert_deny 'impersonate flag' --impersonate-service-account=foo@bar compute instances list || failed=1
+  assert_deny 'flags-file' --flags-file=/tmp/x.yaml compute instances list || failed=1
+  assert_deny 'ssh' compute ssh my-vm || failed=1
+  assert_deny 'resize prefix' compute instances resize-something || failed=1
+  assert_deny 'resource named create' compute instances describe create || failed=1
+
+  if ((failed != 0)); then
+    printf 'self-test failed\n' >&2
+    return 1
+  fi
+  printf 'self-test passed\n'
+}
+
+resolve_gcloud() {
+  local candidate
+  if [[ -n "${GCLOUD_RO_BIN:-}" ]]; then
+    if [[ ! -x "${GCLOUD_RO_BIN}" ]]; then
+      printf 'gcloud-ro: GCLOUD_RO_BIN is not executable: %s\n' "${GCLOUD_RO_BIN}" >&2
+      exit 1
+    fi
+    printf '%s' "${GCLOUD_RO_BIN}"
+    return
+  fi
+
+  local self
+  self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+  while IFS= read -r candidate; do
+    if [[ "$(cd "$(dirname "$candidate")" && pwd)/$(basename "$candidate")" == "$self" ]]; then
+      continue
+    fi
+    printf '%s' "$candidate"
+    return
+  done < <(type -aP gcloud 2>/dev/null || true)
+
+  printf 'gcloud-ro: real gcloud binary not found on PATH\n' >&2
+  exit 1
+}
+
+main() {
+  case "${1:-}" in
+    --self-test)
+      self_test
+      return
+      ;;
+    --print-policy)
+      print_policy
+      return
+      ;;
+    --help|-h)
+      if (($# == 1)); then
+        usage
+        return
+      fi
+      ;;
+  esac
+
+  if [[ -n "${CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT:-}" ]]; then
+    deny "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT is not allowed"
+    exit 2
+  fi
+  if [[ -n "${CLOUDSDK_AUTH_ACCESS_TOKEN_FILE:-}" ]]; then
+    deny "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE is not allowed"
+    exit 2
+  fi
+
+  if ! approve_args "$@"; then
+    exit 2
+  fi
+
+  if [[ "${GCLOUD_RO_DRY_RUN:-}" == "1" ]]; then
+    printf 'gcloud-ro: would run:'
+    printf ' %q' gcloud "$@"
+    printf '\n'
+    exit 0
+  fi
+
+  local gcloud_bin
+  gcloud_bin="$(resolve_gcloud)"
+  exec "$gcloud_bin" "$@"
+}
+
+main "$@"
